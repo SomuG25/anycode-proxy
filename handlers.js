@@ -1,0 +1,941 @@
+const crypto = require("crypto");
+const { ALL_MODELS, MODEL_ALIASES } = require("./config");
+const { convertAnthropicToAlpha } = require("./converter");
+const { AlphaToAnthropicStreamConverter } = require("./stream");
+const { readBody, respond, respondError, forwardToAlpha } = require("./utils");
+const { searchWeb, formatSearchResults } = require("./websearch");
+const { handleHaikuTroll } = require("./troll");
+const {
+  convertAnthropicToOpenAI,
+  forwardToOpenRouter,
+  OpenAIToAnthropicStreamConverter,
+} = require("./openrouter");
+const { handleAerolinkRequest } = require("./aerolink");
+
+// ─── Model name normalization ─────────────────────────────────────────────────
+// Claude Code sometimes sends versioned model names like "claude-haiku-4-5-20251001"
+// or provider-prefixed names like "anthropic:claude-haiku-4-5".
+//
+// IMPORTANT: Claude Code uses claude-haiku internally for background tasks
+// (titles, summaries). Those come with date suffixes like "claude-haiku-4-5-20251001".
+// If the user explicitly picks a claude model via /model (e.g. "claude-sonnet-4-6"),
+// we pass it through. Only remap unknown/background claude models to fallback.
+const FALLBACK_MODEL = "deepseek/deepseek-v4-pro";
+
+// Build sets for fast lookup
+const KNOWN_MODEL_IDS = new Set(ALL_MODELS.map((m) => m.id));
+const OPENROUTER_MODEL_IDS = new Set(
+  ALL_MODELS.filter((m) => m.provider === "openrouter").map((m) => m.id)
+);
+const AEROLINK_MODEL_IDS = new Set(
+  ALL_MODELS.filter((m) => m.provider === "aerolink").map((m) => m.id)
+);
+
+// Sentinel used to route haiku to the infinite troll loop
+const HAIKU_TROLL_SENTINEL = "claude-haiku-troll";
+
+function normalizeModel(model) {
+  if (!model) return FALLBACK_MODEL;
+  // Strip provider prefixes (anthropic:, openai:, google:, etc.)
+  model = model.replace(/^[a-zA-Z]+:/, "");
+  // Strip date suffixes like -20251001
+  const stripped = model.replace(/-\d{8}$/, "");
+  // Check model aliases first (e.g. "sonnet" → "claude-sonnet-4-6")
+  if (MODEL_ALIASES[model]) return MODEL_ALIASES[model];
+  if (MODEL_ALIASES[stripped]) return MODEL_ALIASES[stripped];
+  // Haiku → check if it's a real AeroLink model or troll mode
+  const isKnownModel = KNOWN_MODEL_IDS.has(model) || KNOWN_MODEL_IDS.has(stripped);
+  if (model.startsWith("claude-haiku") || stripped.startsWith("claude-haiku")) {
+    // Known AeroLink Haiku → pass through as real
+    if (isKnownModel) return model;
+    // Unknown haiku → troll mode
+    console.log(`  😈 unknown haiku detected → troll mode`);
+    return HAIKU_TROLL_SENTINEL;
+  }
+  // If the model (with or without date suffix) is in our registry, pass through
+  if (KNOWN_MODEL_IDS.has(model)) return model;
+  if (KNOWN_MODEL_IDS.has(stripped)) return stripped;
+  // Unknown claude-* model → background task → remap to fallback
+  if (model.startsWith("claude-")) {
+    console.log(`  ⚙ remapping background model "${model}" → ${FALLBACK_MODEL}`);
+    return FALLBACK_MODEL;
+  }
+  return model;
+}
+
+// ─── Backend Router ────────────────────────────────────────────────────────────
+function routeToBackend(model) {
+  if (model === HAIKU_TROLL_SENTINEL) return "haiku-troll";
+  if (AEROLINK_MODEL_IDS.has(model)) return "aerolink";
+  if (model.startsWith("aerolink/")) return "aerolink";
+  if (OPENROUTER_MODEL_IDS.has(model)) return "openrouter";
+  if (model.startsWith("anthropic/")) return "openrouter";
+  return "commandcode";
+}
+
+// Look up the openrouterId for a given model ID
+function getOpenRouterId(model) {
+  const entry = ALL_MODELS.find((m) => m.id === model);
+  if (entry?.openrouterId) return entry.openrouterId;
+  // If already namespaced (e.g. "anthropic/claude-sonnet-4-6"), use as-is
+  if (model.includes("/")) return model;
+  return model;
+}
+// ─── Request Classification ─────────────────────────────────────────────────
+
+/**
+ * Detect what type of request this is based on patterns.
+ */
+function classifyRequest(body) {
+  const msgCount = (body.messages || []).length;
+  const toolCount = (body.tools || []).length;
+  const lastMsg = body.messages?.[body.messages.length - 1];
+  const lastContent = typeof lastMsg?.content === "string"
+    ? lastMsg.content
+    : JSON.stringify(lastMsg?.content || "");
+
+  // Title/summary generation — 1 message, 0 tools, short content
+  if (msgCount <= 2 && toolCount === 0) {
+    return "📝 title/summary";
+  }
+
+  // Subagent explore — many tools, duplicate message count pattern
+  if (toolCount > 20 && msgCount > 100) {
+    return "🔍 subagent/explore";
+  }
+
+  // Background compaction
+  if (lastContent.includes("compact") || lastContent.includes("summarize this conversation")) {
+    return "📦 compaction";
+  }
+
+  return "👤 user";
+}
+
+// ─── Request Handlers ────────────────────────────────────────────────────────
+
+/**
+ * GET /v1/models — Return list of available models.
+ */
+function handleModels(req, res) {
+  respond(res, 200, {
+    object: "list",
+    data: ALL_MODELS.map((m) => ({
+      id: m.id,
+      object: "model",
+      created: Math.floor(Date.now() / 1000),
+      owned_by: m.provider,
+    })),
+  });
+}
+
+/**
+ * POST /v1/messages — Main endpoint. Receives Anthropic format, converts,
+ * forwards to /alpha/generate, and converts the response back.
+ */
+async function handleMessages(req, res) {
+  // Parse body
+  const rawBody = await readBody(req);
+  let body;
+  try {
+    body = JSON.parse(rawBody);
+  } catch {
+    return respondError(res, 400, "invalid_request_error", "Invalid JSON body");
+  }
+
+  let model = normalizeModel(body.model);
+  const isStream = body.stream === true;
+  const toolCount = (body.tools || []).length;
+  const msgCount = (body.messages || []).length;
+
+  // ── Classify and tag the request ──────────────────────────────────────
+  const requestType = classifyRequest(body);
+
+  // Force DeepSeek for ALL background/subagent requests — this protects
+  // OpenRouter credits. Only the user's main session uses their chosen model.
+  const isBackground = requestType !== "👤 user";
+  if (isBackground && model !== FALLBACK_MODEL) {
+    console.log(`  🔄 background reroute: 🟣${model} → 🟢${FALLBACK_MODEL}`);
+    model = FALLBACK_MODEL;
+  }
+
+  // Normalize model name in body before conversion
+  body.model = model;
+
+  // ── Determine backend ─────────────────────────────────────────────────
+  const backend = routeToBackend(model);
+
+  const modelIcon = backend === "aerolink" ? "🟣" : backend === "openrouter" ? "🔵" : "🟢";
+  console.log(`  ${modelIcon} model=${model}  route=${backend}  stream=${isStream}`);
+  console.log(`  ├ messages=${msgCount} tools=${toolCount} [${requestType}]`);
+
+  // ── Handle server-side web_search requests ───────────────────────────
+  // Claude Code sends these as separate requests with the web_search tool.
+  // We execute the search and return results directly — no need to forward.
+  const serverSearchResult = await handleServerSideSearch(body, res);
+  if (serverSearchResult) return; // Already responded
+
+  // ── Intercept empty web_search results in conversation history ────────
+  await enhanceWebSearchResults(body.messages);
+
+  // Set up abort controller to cancel upstream when client disconnects
+  const ac = new AbortController();
+  req.on("close", () => ac.abort());
+
+  // ── Route to Haiku Troll (infinite fake-thinking loop) ───────────────
+  if (backend === "haiku-troll") {
+    return handleHaikuTroll(res, ac);
+  }
+
+  // ── Route to AeroLink (cheaper Claude models) ─────────────────────────
+  if (backend === "aerolink") {
+    return handleAerolinkRequest(body, res, model, ac, isStream);
+  }
+
+  // ── Route to OpenRouter ───────────────────────────────────────────────
+  if (backend === "openrouter") {
+    return handleOpenRouterRequest(body, res, model, ac, isStream);
+  }
+
+  // ── Route to Command Code (existing path) ─────────────────────────────
+  try {
+    // Convert Anthropic → Alpha format
+    const alphaBody = convertAnthropicToAlpha(body);
+    const convertedToolCount = alphaBody.params.tools.length;
+
+    if (convertedToolCount !== toolCount) {
+      console.log(
+        `  ├ tools: ${toolCount} → ${convertedToolCount} (${toolCount - convertedToolCount} skipped, built-in converted)`
+      );
+    }
+
+    // Debug: log message structure
+    const convertedMsgs = alphaBody.params.messages;
+    console.log(
+      `  ├ converted msgs: ${convertedMsgs.length} [${convertedMsgs.slice(0, 5).map(m => {
+        const ct = typeof m.content === "string" ? "str" : `arr(${m.content.length})`;
+        return `${m.role}:${ct}`;
+      }).join(", ")}${convertedMsgs.length > 5 ? ", ..." : ""}]`
+    );
+
+    // Forward to Command Code (with abort signal)
+    const upstream = await forwardToAlpha(alphaBody, ac.signal);
+    console.log(`  └ upstream status=${upstream.statusCode}`);
+
+    // Handle upstream errors
+    if (upstream.statusCode >= 400) {
+      return handleUpstreamError(upstream, res);
+    }
+
+    // Handle response
+    if (isStream) {
+      handleStreamResponse(upstream, res, model, ac, body, alphaBody);
+    } else {
+      handleNonStreamResponse(upstream, res, model);
+    }
+  } catch (err) {
+    // Suppress errors from client disconnect
+    if (err.name === "AbortError" || ac.signal.aborted) return;
+    console.error(`  ✗ error: ${err.message}`);
+    respondError(res, 500, "api_error", err.message);
+  }
+}
+
+// ─── OpenRouter Request Handler ───────────────────────────────────────────────
+
+/**
+ * Handle a request routed to OpenRouter.
+ * Converts Anthropic→OpenAI format, forwards, converts OpenAI SSE→Anthropic SSE.
+ */
+async function handleOpenRouterRequest(body, res, model, ac, isStream) {
+  const openrouterModelId = getOpenRouterId(model);
+  console.log(`  ├ openrouter model: ${openrouterModelId}`);
+
+  // Estimate input tokens for message_start
+  const msgStr = JSON.stringify(body?.messages || []);
+  const toolStr = JSON.stringify(body?.tools || []);
+  const sysStr = typeof body?.system === "string" ? body.system : JSON.stringify(body?.system || "");
+  const estimatedInputTokens = Math.ceil((msgStr.length + toolStr.length + sysStr.length) / 4);
+
+  try {
+    // Convert request: Anthropic → OpenAI format
+    const openaiBody = convertAnthropicToOpenAI(body, openrouterModelId);
+    const toolCount = openaiBody.tools?.length || 0;
+    console.log(`  ├ OR msgs=${openaiBody.messages.length} tools=${toolCount}`);
+
+    // Forward to OpenRouter
+    const upstream = await forwardToOpenRouter(openaiBody, ac.signal);
+    console.log(`  └ OR upstream status=${upstream.statusCode}`);
+
+    // Handle upstream HTTP errors
+    if (upstream.statusCode >= 400) {
+      const errChunks = [];
+      upstream.on("data", (c) => errChunks.push(c));
+      upstream.on("end", () => {
+        const raw = Buffer.concat(errChunks).toString();
+        console.error(`  ✗ OR upstream error: ${raw.slice(0, 300)}`);
+        respondError(res, upstream.statusCode, "api_error",
+          `OpenRouter error: ${raw.slice(0, 500)}`);
+      });
+      return;
+    }
+
+    if (isStream) {
+      // Set up Anthropic SSE headers
+      res.writeHead(200, {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        Connection: "keep-alive",
+        "Access-Control-Allow-Origin": "*",
+      });
+
+      const converter = new OpenAIToAnthropicStreamConverter(model, res, estimatedInputTokens, "OR");
+
+      upstream.on("data", (chunk) => {
+        if (ac.signal.aborted) return;
+        converter.processChunk(chunk.toString());
+      });
+
+      upstream.on("end", () => {
+        converter.flush();
+        if (!res.writableEnded) res.end();
+      });
+
+      upstream.on("error", (err) => {
+        if (err.message === "aborted" || ac.signal.aborted) return;
+        console.error(`  ✗ OR stream error: ${err.message}`);
+        converter.flush();
+        if (!res.writableEnded) res.end();
+      });
+    } else {
+      // Non-streaming: collect entire response, convert to Anthropic format
+      const chunks = [];
+      upstream.on("data", (c) => chunks.push(c));
+      upstream.on("end", () => {
+        const raw = Buffer.concat(chunks).toString();
+        try {
+          const openaiResp = JSON.parse(raw);
+          const choice = openaiResp.choices?.[0]?.message || {};
+          const usage = openaiResp.usage || {};
+
+          // Build content array
+          const content = [];
+          if (choice.content) content.push({ type: "text", text: choice.content });
+          for (const tc of choice.tool_calls || []) {
+            let input = {};
+            try { input = JSON.parse(tc.function.arguments || "{}"); } catch {}
+            content.push({
+              type: "tool_use",
+              id: tc.id,
+              name: tc.function.name,
+              input,
+            });
+          }
+          if (content.length === 0) content.push({ type: "text", text: "" });
+
+          const finishReason = openaiResp.choices?.[0]?.finish_reason || "stop";
+          const stopReason = finishReason === "tool_calls" ? "tool_use"
+            : finishReason === "length" ? "max_tokens" : "end_turn";
+
+          respond(res, 200, {
+            id: `msg_${crypto.randomUUID().replace(/-/g, "").slice(0, 24)}`,
+            type: "message",
+            role: "assistant",
+            content,
+            model,
+            stop_reason: stopReason,
+            stop_sequence: null,
+            usage: {
+              input_tokens: usage.prompt_tokens || estimatedInputTokens,
+              output_tokens: usage.completion_tokens || 0,
+            },
+          });
+        } catch (parseErr) {
+          console.error(`  ✗ OR parse error: ${parseErr.message}`);
+          respondError(res, 500, "api_error", `Failed to parse OpenRouter response: ${raw.slice(0, 200)}`);
+        }
+      });
+    }
+  } catch (err) {
+    if (err.name === "AbortError" || ac.signal.aborted) return;
+    console.error(`  ✗ OR error: ${err.message}`);
+    respondError(res, 500, "api_error", err.message);
+  }
+}
+
+// ─── Command Code Request Handlers ───────────────────────────────────────────
+
+/**
+ * Handle upstream error responses.
+ */
+function handleUpstreamError(upstream, res) {
+  const errChunks = [];
+  upstream.on("data", (c) => errChunks.push(c));
+  upstream.on("end", () => {
+    const raw = Buffer.concat(errChunks).toString();
+    console.error(`  ✗ upstream error: ${raw.slice(0, 300)}`);
+    respondError(res, upstream.statusCode, "api_error", raw.slice(0, 500));
+  });
+}
+
+/**
+ * Handle streaming response — convert Alpha SSE → Anthropic SSE.
+ * Detects transient SSE errors (service unavailable, overloaded) and retries
+ * automatically when no data has been written to the client yet.
+ */
+function handleStreamResponse(upstream, res, model, ac, body, alphaBody) {
+  // Fast transient errors: retry quickly (2s delay, up to 25 times)
+  const FAST_RETRY_PATTERNS = /temporarily unavailable|overloaded|try again|network connection lost|connection reset|socket hang up|ECONNRESET|internal server error|bad gateway|service unavailable|gateway timeout/i;
+  // Rate limit errors: exponential backoff (start 10s, double each time, max 5 retries)
+  const RATE_LIMIT_PATTERNS = /rate limit|too many requests|quota|429/i;
+  const MAX_FAST_RETRIES = 25;
+  const MAX_RATE_RETRIES = 5;
+  const FAST_RETRY_DELAY_MS = 2000;
+  const RATE_RETRY_BASE_MS = 10000; // 10s base, doubles each retry
+
+  res.writeHead(200, {
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache",
+    Connection: "keep-alive",
+  });
+
+  // Estimate input tokens from request body so message_start has a real number
+  // (Claude Code reads input_tokens from message_start, which we send before knowing actual usage)
+  const msgStr = JSON.stringify(body?.messages || []);
+  const toolStr = JSON.stringify(body?.tools || []);
+  const sysStr = typeof body?.system === "string" ? body.system : JSON.stringify(body?.system || "");
+  const estimatedInputTokens = Math.ceil((msgStr.length + toolStr.length + sysStr.length) / 4);
+
+  function attachStream(src, retryCount) {
+    const converter = new AlphaToAnthropicStreamConverter(model, res, estimatedInputTokens);
+    let retried = false;
+
+    src.on("data", (chunk) => {
+      if (retried) return;
+      const text = chunk.toString();
+
+      // Check for transient SSE error before the converter has written anything
+      const isRateLimit = false; // will be set below per-error
+      if (!converter.started) {
+        // Parse each line to look for an error event
+        const lines = text.split("\n");
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed) continue;
+          try {
+            const evt = JSON.parse(trimmed);
+            if (evt.type === "error") {
+              const errMsg = typeof evt.error === "string"
+                ? evt.error
+                : evt.error?.message || JSON.stringify(evt.error);
+              const isRateLimitErr = RATE_LIMIT_PATTERNS.test(errMsg);
+              const isFastErr = FAST_RETRY_PATTERNS.test(errMsg);
+              const maxRetries = isRateLimitErr ? MAX_RATE_RETRIES : MAX_FAST_RETRIES;
+              if ((isRateLimitErr || isFastErr) && retryCount < maxRetries) {
+                retried = true;
+                src.destroy();
+                const delayMs = isRateLimitErr
+                  ? Math.min(RATE_RETRY_BASE_MS * Math.pow(2, retryCount), 120000) // 10s→20s→40s→80s→120s
+                  : FAST_RETRY_DELAY_MS;
+                const kind = isRateLimitErr ? "rate limit" : "transient";
+                console.log(`  ↻ retrying after ${kind} error (attempt ${retryCount + 1}/${maxRetries}, wait ${delayMs / 1000}s): ${errMsg.slice(0, 80)}`);
+                setTimeout(async () => {
+                  try {
+                    const newUpstream = await forwardToAlpha(alphaBody, ac.signal);
+                    console.log(`  └ retry upstream status=${newUpstream.statusCode}`);
+                    if (newUpstream.statusCode >= 400) {
+                      // Can't retry an HTTP-level error, just forward it as text
+                      const errChunks = [];
+                      newUpstream.on("data", (c) => errChunks.push(c));
+                      newUpstream.on("end", () => {
+                        const raw = Buffer.concat(errChunks).toString();
+                        console.error(`  ✗ retry upstream error: ${raw.slice(0, 300)}`);
+                        converter.ensureStarted();
+                        converter.openTextBlock();
+                        converter.res.write(
+                          `event: content_block_delta\ndata: ${JSON.stringify({
+                            type: "content_block_delta",
+                            index: converter.contentIndex,
+                            delta: { type: "text_delta", text: `Error: ${raw.slice(0, 500)}` },
+                          })}\n\n`
+                        );
+                        converter.closeTextBlock();
+                        converter.flush();
+                        if (!res.writableEnded) res.end();
+                      });
+                    } else {
+                      attachStream(newUpstream, retryCount + 1);
+                    }
+                  } catch (retryErr) {
+                    if (retryErr.name === "AbortError" || ac.signal.aborted) return;
+                    console.error(`  ✗ retry failed: ${retryErr.message}`);
+                    converter.flush();
+                    if (!res.writableEnded) res.end();
+                  }
+                }, delayMs);
+                return;
+              }
+            }
+          } catch {
+            // Not JSON, ignore
+          }
+        }
+      }
+
+      if (!retried) converter.processChunk(text);
+    });
+
+    src.on("end", () => {
+      if (retried) return;
+      converter.flush();
+      if (!res.writableEnded) res.end();
+    });
+
+    src.on("error", (err) => {
+      if (retried) return;
+      if (err.message === "aborted" || ac?.signal?.aborted) return;
+      // TCP-level errors (ECONNRESET, ENOTFOUND, etc.) — treat as transient and retry
+      const isTcpTransient = /ECONNRESET|ENOTFOUND|ETIMEDOUT|ECONNREFUSED|socket hang up/i.test(err.message);
+      if (isTcpTransient && retryCount < MAX_FAST_RETRIES) {
+        retried = true;
+        src.destroy();
+        console.log(`  ↻ retrying after TCP error (attempt ${retryCount + 1}/${MAX_FAST_RETRIES}, wait 2s): ${err.message}`);
+        setTimeout(async () => {
+          try {
+            const newUpstream = await forwardToAlpha(alphaBody, ac.signal);
+            console.log(`  └ retry upstream status=${newUpstream.statusCode}`);
+            if (newUpstream.statusCode >= 400) {
+              converter.flush();
+              if (!res.writableEnded) res.end();
+            } else {
+              attachStream(newUpstream, retryCount + 1);
+            }
+          } catch (retryErr) {
+            if (retryErr.name === "AbortError" || ac.signal.aborted) return;
+            console.error(`  ✗ TCP retry failed: ${retryErr.message}`);
+            converter.flush();
+            if (!res.writableEnded) res.end();
+          }
+        }, FAST_RETRY_DELAY_MS);
+        return;
+      }
+      console.error(`  ✗ stream error: ${err.message}`);
+      converter.flush();
+      if (!res.writableEnded) res.end();
+    });
+  }
+
+  attachStream(upstream, 0);
+}
+
+/**
+ * Handle non-streaming response — collect all events, build Anthropic response.
+ */
+function handleNonStreamResponse(upstream, res, model) {
+  const allEvents = [];
+  let sseBuffer = "";
+
+  upstream.on("data", (chunk) => {
+    sseBuffer += chunk.toString();
+    const lines = sseBuffer.split("\n");
+    sseBuffer = lines.pop() || "";
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      try {
+        allEvents.push(JSON.parse(trimmed));
+      } catch {}
+    }
+  });
+
+  upstream.on("end", () => {
+    // Process remaining buffer
+    if (sseBuffer.trim()) {
+      try {
+        allEvents.push(JSON.parse(sseBuffer.trim()));
+      } catch {}
+    }
+
+    const anthResp = buildNonStreamingResponse(allEvents, model);
+    respond(res, 200, anthResp);
+  });
+}
+
+/**
+ * Build a complete Anthropic /v1/messages response from collected SSE events.
+ */
+function buildNonStreamingResponse(events, model) {
+  const content = [];
+  let inputTokens = 0;
+  let outputTokens = 0;
+  let stopReason = "end_turn";
+  let currentText = "";
+
+  for (const event of events) {
+    switch (event.type) {
+      case "text-delta":
+        currentText += event.text;
+        break;
+
+      case "tool-call":
+        if (currentText) {
+          content.push({ type: "text", text: currentText });
+          currentText = "";
+        }
+        content.push({
+          type: "tool_use",
+          id: event.toolCallId,
+          name: event.toolName,
+          input: event.input || event.args || {},
+        });
+        break;
+
+      case "finish": {
+        const usage = event.totalUsage || event.usage || {};
+        if (Object.keys(usage).length > 0) {
+          console.log(`  📊 usage: ${JSON.stringify(usage)}`);
+        }
+        inputTokens =
+          usage.inputTokens || usage.promptTokens || usage.prompt_tokens ||
+          usage.input_tokens || 0;
+        outputTokens =
+          usage.outputTokens || usage.completionTokens || usage.completion_tokens ||
+          usage.output_tokens || 0;
+        if (event.finishReason === "tool-calls") stopReason = "tool_use";
+        else if (event.finishReason === "length") stopReason = "max_tokens";
+        break;
+      }
+    }
+  }
+
+  if (currentText) {
+    content.push({ type: "text", text: currentText });
+  }
+  if (content.length === 0) {
+    content.push({ type: "text", text: "" });
+  }
+
+  return {
+    id: `msg_${crypto.randomUUID().replace(/-/g, "").slice(0, 24)}`,
+    type: "message",
+    role: "assistant",
+    content,
+    model,
+    stop_reason: stopReason,
+    stop_sequence: null,
+    usage: { input_tokens: inputTokens, output_tokens: outputTokens },
+  };
+}
+
+/**
+ * GET / or /health — Health check.
+ */
+function handleHealth(req, res) {
+  const { AUTH } = require("./config");
+  respond(res, 200, {
+    status: "ok",
+    proxy: "cc-proxy",
+    user: AUTH.userName,
+    models: ALL_MODELS.length,
+    endpoint: "/alpha/generate",
+  });
+}
+
+// ─── Server-Side Web Search ──────────────────────────────────────────────────
+
+/**
+ * Detect and handle server-side web search requests.
+ * Claude Code sends these as separate POST /v1/messages with:
+ *   - 1 message (the user query)
+ *   - 1 tool (web_search_20250305 type)
+ * We execute the search and return results in Anthropic's server_tool_use format.
+ *
+ * Returns true if we handled it, false if this isn't a search request.
+ */
+async function handleServerSideSearch(body, res) {
+  const tools = body.tools || [];
+
+  // Detect: does this request have a web_search built-in tool?
+  const wsToolIdx = tools.findIndex(
+    (t) => t.type === "web_search_20250305" || (t.name === "web_search" && !t.input_schema)
+  );
+  if (wsToolIdx === -1) return false;
+
+  // Get the user's query from the last message
+  const msgs = body.messages || [];
+  const lastMsg = msgs[msgs.length - 1];
+  if (!lastMsg) return false;
+
+  const userQuery =
+    typeof lastMsg.content === "string"
+      ? lastMsg.content
+      : Array.isArray(lastMsg.content)
+        ? lastMsg.content
+            .filter((b) => b.type === "text")
+            .map((b) => b.text)
+            .join(" ")
+        : "";
+
+  if (!userQuery) return false;
+
+  // Clean up the query for better DuckDuckGo results
+  const cleanedQuery = cleanSearchQuery(userQuery);
+  console.log(`  🔍 server-side web search: "${cleanedQuery.slice(0, 80)}"`);
+
+  // Execute real search
+  const results = await searchWeb(cleanedQuery);
+  console.log(`  🔍 got ${results.length} results`);
+
+  const isStream = body.stream === true;
+  const msgId = `msg_${crypto.randomUUID().replace(/-/g, "").slice(0, 24)}`;
+  const toolUseId = `srvtoolu_${crypto.randomUUID().replace(/-/g, "").slice(0, 20)}`;
+
+  if (isStream) {
+    // Return as Anthropic SSE stream
+    res.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      Connection: "keep-alive",
+    });
+
+    const write = (event) =>
+      res.write(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
+
+    // message_start
+    write({
+      type: "message_start",
+      message: {
+        id: msgId,
+        type: "message",
+        role: "assistant",
+        content: [],
+        model: body.model || "deepseek/deepseek-v4-pro",
+        stop_reason: null,
+        stop_sequence: null,
+        usage: { input_tokens: 0, output_tokens: 0 },
+      },
+    });
+
+    // server_tool_use block (the search call)
+    write({
+      type: "content_block_start",
+      index: 0,
+      content_block: {
+        type: "server_tool_use",
+        id: toolUseId,
+        name: "web_search",
+        input: { query: userQuery },
+      },
+    });
+    write({ type: "content_block_stop", index: 0 });
+
+    // web_search_tool_result block (the results)
+    write({
+      type: "content_block_start",
+      index: 1,
+      content_block: {
+        type: "web_search_tool_result",
+        tool_use_id: toolUseId,
+        content: results.map((r) => ({
+          type: "web_search_result",
+          url: r.url,
+          title: r.title,
+          encrypted_content: r.snippet,
+          page_age: null,
+        })),
+      },
+    });
+    write({ type: "content_block_stop", index: 1 });
+
+    // Text block with a summary
+    const summaryText = results.length > 0
+      ? `I found ${results.length} results. Let me analyze them.\n`
+      : "I couldn't find any search results. Let me try a different approach.\n";
+
+    write({
+      type: "content_block_start",
+      index: 2,
+      content_block: { type: "text", text: "" },
+    });
+    write({
+      type: "content_block_delta",
+      index: 2,
+      delta: { type: "text_delta", text: summaryText },
+    });
+    write({ type: "content_block_stop", index: 2 });
+
+    // message_delta + stop
+    write({
+      type: "message_delta",
+      delta: { stop_reason: "end_turn", stop_sequence: null },
+      usage: { output_tokens: 50 },
+    });
+    write({ type: "message_stop" });
+
+    res.end();
+  } else {
+    // Non-streaming response
+    respond(res, 200, {
+      id: msgId,
+      type: "message",
+      role: "assistant",
+      content: [
+        {
+          type: "server_tool_use",
+          id: toolUseId,
+          name: "web_search",
+          input: { query: userQuery },
+        },
+        {
+          type: "web_search_tool_result",
+          tool_use_id: toolUseId,
+          content: results.map((r) => ({
+            type: "web_search_result",
+            url: r.url,
+            title: r.title,
+            encrypted_content: r.snippet,
+            page_age: null,
+          })),
+        },
+        {
+          type: "text",
+          text:
+            results.length > 0
+              ? `I found ${results.length} results. Let me analyze them.`
+              : "I couldn't find any search results.",
+        },
+      ],
+      model: body.model || "deepseek/deepseek-v4-pro",
+      stop_reason: "end_turn",
+      stop_sequence: null,
+      usage: { input_tokens: 0, output_tokens: 50 },
+    });
+  }
+
+  return true;
+}
+
+// ─── Web Search Enhancement ──────────────────────────────────────────────────
+
+
+/**
+ * Scan messages for empty web_search tool_results.
+ * When found, execute a real search and replace the content.
+ *
+ * Flow:
+ *   1. Model calls web_search → Claude Code gets tool_use
+ *   2. Claude Code tries to execute locally → gets 0 results
+ *   3. Claude Code sends tool_result with empty content
+ *   4. THIS function detects it, runs DuckDuckGo search, injects real results
+ *   5. Model now has actual search data to work with
+ */
+async function enhanceWebSearchResults(messages) {
+  if (!messages || messages.length === 0) return;
+
+  for (let i = 0; i < messages.length; i++) {
+    const msg = messages[i];
+
+    // Only check user messages with array content (tool_results live here)
+    if (msg.role !== "user" || !Array.isArray(msg.content)) continue;
+
+    for (const block of msg.content) {
+      if (block.type !== "tool_result") continue;
+
+      // Find the matching tool_use in the previous assistant message
+      const prevMsg = messages[i - 1];
+      if (!prevMsg || prevMsg.role !== "assistant" || !Array.isArray(prevMsg.content)) continue;
+
+      const toolUse = prevMsg.content.find(
+        (b) => b.type === "tool_use" && b.id === block.tool_use_id && b.name === "web_search"
+      );
+      if (!toolUse) continue;
+
+      // Check if the result is empty/minimal
+      const resultText = extractResultText(block.content);
+      if (resultText.length > 100) continue; // Has real results, skip
+
+      // Get the search query and clean it up
+      const rawQuery = toolUse.input?.query;
+      if (!rawQuery) continue;
+
+      const query = cleanSearchQuery(rawQuery);
+      console.log(`  🔍 executing web search: "${query}"`);
+
+      // Execute real search
+      const results = await searchWeb(query);
+
+      if (results.length > 0) {
+        console.log(`  🔍 got ${results.length} results`);
+        // Replace the empty content with real results
+        block.content = [{ type: "text", text: formatSearchResults(results, query) }];
+        block.is_error = false;
+      }
+    }
+  }
+}
+
+/**
+ * Extract plain text from a tool_result content field.
+ */
+function extractResultText(content) {
+  if (!content) return "";
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content
+      .map((c) => {
+        if (typeof c === "string") return c;
+        if (c.type === "text") return c.text || "";
+        return JSON.stringify(c);
+      })
+      .join(" ");
+  }
+  return JSON.stringify(content);
+}
+
+// ─── Search Query Cleanup ────────────────────────────────────────────────────
+
+/**
+ * Clean up web search queries for better DuckDuckGo results.
+ * The model often sends overly specific or prefixed queries like:
+ *   "Perform a web search for the query: gemini live api..."
+ *   'gemini live api "inputTranscription" "outputTranscription"'
+ * DuckDuckGo chokes on long quoted strings and meta-prefixes.
+ */
+function cleanSearchQuery(query) {
+  if (!query) return "";
+
+  // Remove common meta-prefixes the model adds
+  query = query
+    .replace(/^Perform a web search for the query:\s*/i, "")
+    .replace(/^Search the web for:\s*/i, "")
+    .replace(/^Search for:\s*/i, "")
+    .replace(/^Web search:\s*/i, "")
+    .replace(/^Please search for:\s*/i, "")
+    .trim();
+
+  // Remove excessive exact-match quotes that DDG can't handle well
+  // e.g., 'gemini "inputTranscription" "outputTranscription" "config"'
+  // Count quoted segments — if more than 2, remove all quotes
+  const quoteCount = (query.match(/"/g) || []).length;
+  if (quoteCount > 4) {
+    query = query.replace(/"/g, "");
+  }
+
+  // Remove site: operators (DDG handles them differently)
+  // Keep the domain as a keyword instead
+  query = query.replace(/site:(\S+)/g, "$1");
+
+  // Cap query length — DDG returns bad results for very long queries
+  if (query.length > 150) {
+    // Try to cut at a word boundary
+    query = query.slice(0, 150).replace(/\s+\S*$/, "");
+  }
+
+  return query.trim();
+}
+
+module.exports = {
+  handleModels,
+  handleMessages,
+  handleHealth,
+};

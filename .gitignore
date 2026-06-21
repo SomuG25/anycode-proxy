@@ -1,0 +1,12 @@
+node_modules/
+*.log
+.env
+.DS_Store
+Thumbs.db
+
+# Auth files — never commit these
+auth.json
+
+# Backup files from debugging sessions
+handlers_*.js
+haiku_workspace/

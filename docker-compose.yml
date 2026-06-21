@@ -1,0 +1,31 @@
+version: "3.8"
+
+services:
+  # SearXNG — meta-search engine (aggregates 70+ search engines)
+  searxng:
+    image: searxng/searxng:latest
+    container_name: searxng
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./searxng-settings.yml:/etc/searxng/settings.yml:ro
+    environment:
+      - SEARXNG_SECRET_KEY=change-me-to-a-random-string
+    restart: unless-stopped
+
+  # AnyCode Proxy — AeroLink (Claude) + Command Code (DeepSeek)
+  proxy:
+    build: .
+    container_name: anycode-proxy
+    ports:
+      - "4141:4141"
+    volumes:
+      - ~/.commandcode:/root/.commandcode:ro
+    environment:
+      # SearXNG runs inside Docker network — use service name, not localhost
+      - SEARXNG_URL=http://searxng:8080
+      # AeroLink API key — Docker Compose reads this from your .env file
+      - AEROLINK_API_KEY=${AEROLINK_API_KEY}
+    depends_on:
+      - searxng
+    restart: unless-stopped
