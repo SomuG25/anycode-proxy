@@ -24,8 +24,8 @@ services:
     environment:
       # SearXNG runs inside Docker network — use service name, not localhost
       - SEARXNG_URL=http://searxng:8080
-      # AeroLink API key — Docker Compose reads this from your .env file
-      - AEROLINK_API_KEY=${AEROLINK_API_KEY}
+      # AeroLink API keys — reads from .env (comma-separated, auto-rotates)
+      - AEROLINK_API_KEYS=${AEROLINK_API_KEYS}
     depends_on:
       - searxng
     restart: unless-stopped

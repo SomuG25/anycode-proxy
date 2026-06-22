@@ -10,7 +10,6 @@ const {
   forwardToOpenRouter,
   OpenAIToAnthropicStreamConverter,
 } = require("./openrouter");
-const { handleAerolinkRequest } = require("./aerolink");
 
 // ─── Model name normalization ─────────────────────────────────────────────────
 // Claude Code sometimes sends versioned model names like "claude-haiku-4-5-20251001"
@@ -27,9 +26,6 @@ const KNOWN_MODEL_IDS = new Set(ALL_MODELS.map((m) => m.id));
 const OPENROUTER_MODEL_IDS = new Set(
   ALL_MODELS.filter((m) => m.provider === "openrouter").map((m) => m.id)
 );
-const AEROLINK_MODEL_IDS = new Set(
-  ALL_MODELS.filter((m) => m.provider === "aerolink").map((m) => m.id)
-);
 
 // Sentinel used to route haiku to the infinite troll loop
 const HAIKU_TROLL_SENTINEL = "claude-haiku-troll";
@@ -43,13 +39,9 @@ function normalizeModel(model) {
   // Check model aliases first (e.g. "sonnet" → "claude-sonnet-4-6")
   if (MODEL_ALIASES[model]) return MODEL_ALIASES[model];
   if (MODEL_ALIASES[stripped]) return MODEL_ALIASES[stripped];
-  // Haiku → check if it's a real AeroLink model or troll mode
-  const isKnownModel = KNOWN_MODEL_IDS.has(model) || KNOWN_MODEL_IDS.has(stripped);
+  // Haiku → troll loop (deliberate: we never run Haiku for real)
   if (model.startsWith("claude-haiku") || stripped.startsWith("claude-haiku")) {
-    // Known AeroLink Haiku → pass through as real
-    if (isKnownModel) return model;
-    // Unknown haiku → troll mode
-    console.log(`  😈 unknown haiku detected → troll mode`);
+    console.log(`  😈 haiku detected → troll mode`);
     return HAIKU_TROLL_SENTINEL;
   }
   // If the model (with or without date suffix) is in our registry, pass through
@@ -66,10 +58,8 @@ function normalizeModel(model) {
 // ─── Backend Router ────────────────────────────────────────────────────────────
 function routeToBackend(model) {
   if (model === HAIKU_TROLL_SENTINEL) return "haiku-troll";
-  if (AEROLINK_MODEL_IDS.has(model)) return "aerolink";
-  if (model.startsWith("aerolink/")) return "aerolink";
-  if (OPENROUTER_MODEL_IDS.has(model)) return "openrouter";
   if (model.startsWith("anthropic/")) return "openrouter";
+  if (OPENROUTER_MODEL_IDS.has(model)) return "openrouter";
   return "commandcode";
 }
 
@@ -155,7 +145,7 @@ async function handleMessages(req, res) {
   // OpenRouter credits. Only the user's main session uses their chosen model.
   const isBackground = requestType !== "👤 user";
   if (isBackground && model !== FALLBACK_MODEL) {
-    console.log(`  🔄 background reroute: 🟣${model} → 🟢${FALLBACK_MODEL}`);
+    console.log(`  ⚙ background → forcing ${FALLBACK_MODEL} (was ${model})`);
     model = FALLBACK_MODEL;
   }
 
@@ -165,8 +155,7 @@ async function handleMessages(req, res) {
   // ── Determine backend ─────────────────────────────────────────────────
   const backend = routeToBackend(model);
 
-  const modelIcon = backend === "aerolink" ? "🟣" : backend === "openrouter" ? "🔵" : "🟢";
-  console.log(`  ${modelIcon} model=${model}  route=${backend}  stream=${isStream}`);
+  console.log(`  ├ model=${model} stream=${isStream} route=${backend}`);
   console.log(`  ├ messages=${msgCount} tools=${toolCount} [${requestType}]`);
 
   // ── Handle server-side web_search requests ───────────────────────────
@@ -185,11 +174,6 @@ async function handleMessages(req, res) {
   // ── Route to Haiku Troll (infinite fake-thinking loop) ───────────────
   if (backend === "haiku-troll") {
     return handleHaikuTroll(res, ac);
-  }
-
-  // ── Route to AeroLink (cheaper Claude models) ─────────────────────────
-  if (backend === "aerolink") {
-    return handleAerolinkRequest(body, res, model, ac, isStream);
   }
 
   // ── Route to OpenRouter ───────────────────────────────────────────────

@@ -3,8 +3,6 @@ const { PORT, AUTH, CLI_VERSION, ALL_MODELS } = require("./config");
 const { handleModels, handleMessages, handleHealth } = require("./handlers");
 const { respondError } = require("./utils");
 const { getSearchEngineStatus } = require("./websearch");
-// OpenRouter no longer configured (AeroLink-only now)
-const { getAerolinkStatus } = require("./aerolink");
 
 // ─── Main Server ──────────────────────────────────────────────────────────────
 
@@ -75,7 +73,6 @@ server.listen(PORT, () => {
   console.log("╔══════════════════════════════════════════════════════════╗");
   console.log(`║  ⚡ AnyCode Proxy on http://localhost:${PORT}            ║`);
   console.log("╠══════════════════════════════════════════════════════════╣");
-  console.log("║  🟣 Claude models  ──→ AeroLink (your API key)          ║");
   console.log("║  🟢 DeepSeek/Qwen  ──→ Command Code (free $1/mo plan)   ║");
   console.log("║  🔄 Subagents/bg   ──→ Always DeepSeek (free)           ║");
   console.log("╚══════════════════════════════════════════════════════════╝");
@@ -83,23 +80,15 @@ server.listen(PORT, () => {
   console.log(`  User:         ${AUTH.userName}`);
   console.log(`  CLI Version:  ${CLI_VERSION}`);
   console.log(`  Search:       ${getSearchEngineStatus()}`);
-  console.log(`  AeroLink:     ${getAerolinkStatus()}`);
   console.log("");
 
-  const aeroModels = ALL_MODELS.filter((m) => m.provider === "aerolink");
   const goModels  = ALL_MODELS.filter((m) => m.plan === "go");
   const proModels = ALL_MODELS.filter((m) => m.plan === "pro");
 
   console.log("Available models:");
   console.log("─────────────────────────────────────────────────────────");
 
-  console.log("  🟣 AEROLINK (your API key — DEFAULT for Claude)");
-  for (const m of aeroModels) {
-    console.log(`    • ${m.id.padEnd(22)} ${m.name}`);
-  }
-  console.log("");
-
-  console.log(`  ⚡ All Claude models route through AeroLink only`);
+  console.log("  🟢 COMMAND CODE — GO PLAN (free — execution engine)");
 
   console.log("  🟢 COMMAND CODE — GO PLAN ($1/mo · execution engine)");
   for (const m of goModels) {
