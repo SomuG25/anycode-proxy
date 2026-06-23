@@ -10,6 +10,7 @@ const {
   forwardToOpenRouter,
   OpenAIToAnthropicStreamConverter,
 } = require("./openrouter");
+const { handleZenmuxRequest } = require("./zenmux");
 
 // ─── Model name normalization ─────────────────────────────────────────────────
 // Claude Code sometimes sends versioned model names like "claude-haiku-4-5-20251001"
@@ -25,6 +26,9 @@ const FALLBACK_MODEL = "deepseek/deepseek-v4-pro";
 const KNOWN_MODEL_IDS = new Set(ALL_MODELS.map((m) => m.id));
 const OPENROUTER_MODEL_IDS = new Set(
   ALL_MODELS.filter((m) => m.provider === "openrouter").map((m) => m.id)
+);
+const ZENMUX_MODEL_IDS = new Set(
+  ALL_MODELS.filter((m) => m.provider === "zenmux").map((m) => m.id)
 );
 
 // Sentinel used to route haiku to the infinite troll loop
@@ -58,8 +62,9 @@ function normalizeModel(model) {
 // ─── Backend Router ────────────────────────────────────────────────────────────
 function routeToBackend(model) {
   if (model === HAIKU_TROLL_SENTINEL) return "haiku-troll";
-  if (model.startsWith("anthropic/")) return "openrouter";
+  if (ZENMUX_MODEL_IDS.has(model)) return "zenmux";
   if (OPENROUTER_MODEL_IDS.has(model)) return "openrouter";
+  if (model.startsWith("anthropic/")) return "openrouter";
   return "commandcode";
 }
 
@@ -181,7 +186,12 @@ async function handleMessages(req, res) {
     return handleOpenRouterRequest(body, res, model, ac, isStream);
   }
 
-  // ── Route to Command Code (existing path) ─────────────────────────────
+  // ── Route to Zenmux (GLM models) ─────────────────────────────────────
+  if (backend === "zenmux") {
+    return handleZenmuxRequest(body, res, model, ac, isStream);
+  }
+
+  // ── Route to Command Code ─────────────────────────────────────────────
   try {
     // Convert Anthropic → Alpha format
     const alphaBody = convertAnthropicToAlpha(body);

@@ -74,12 +74,15 @@ server.listen(PORT, () => {
   console.log(`║  ⚡ AnyCode Proxy on http://localhost:${PORT}            ║`);
   console.log("╠══════════════════════════════════════════════════════════╣");
   console.log("║  🟢 DeepSeek/Qwen  ──→ Command Code (free $1/mo plan)   ║");
+  console.log("║  🟡 GLM 5.2         ──→ Zenmux (your API key)           ║");
   console.log("║  🔄 Subagents/bg   ──→ Always DeepSeek (free)           ║");
   console.log("╚══════════════════════════════════════════════════════════╝");
   console.log("");
   console.log(`  User:         ${AUTH.userName}`);
   console.log(`  CLI Version:  ${CLI_VERSION}`);
   console.log(`  Search:       ${getSearchEngineStatus()}`);
+  const { getZenmuxStatus } = require("./zenmux");
+  console.log(`  Zenmux:       ${getZenmuxStatus()}`);
   console.log("");
 
   const goModels  = ALL_MODELS.filter((m) => m.plan === "go");
@@ -89,6 +92,15 @@ server.listen(PORT, () => {
   console.log("─────────────────────────────────────────────────────────");
 
   console.log("  🟢 COMMAND CODE — GO PLAN (free — execution engine)");
+
+  const zenModels = ALL_MODELS.filter((m) => m.provider === "zenmux");
+  if (zenModels.length > 0) {
+    console.log("  🟡 ZENMUX (your API key — GLM models)");
+    for (const m of zenModels) {
+      console.log(`    • ${m.id.padEnd(32)} ${m.name}`);
+    }
+    console.log("");
+  }
 
   console.log("  🟢 COMMAND CODE — GO PLAN ($1/mo · execution engine)");
   for (const m of goModels) {

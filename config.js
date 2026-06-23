@@ -31,6 +31,9 @@ const ALPHA_ENDPOINT = "/alpha/generate";
 // ─── OpenRouter Configuration ─────────────────────────────────────────────────
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || null;
 
+// ─── Zenmux Configuration ──────────────────────────────────────────────────
+const ZENMUX_API_KEY = process.env.ZENMUX_API_KEY || null;
+
 // ─── Load auth from Command Code's CLI auth file ─────────────────────────────
 function loadAuth() {
   const authPath = path.join(
@@ -84,6 +87,9 @@ const ALL_MODELS = [
   { id: "qwen-3.6-plus",        name: "Qwen 3.6 Plus",        provider: "qwen", plan: "go" },
   { id: "step-3.5-flash", name: "Step 3.5 Flash", provider: "stepfun", plan: "go" },
 
+  // ══ ZENMUX BACKEND (GLM models) ═════════════════════════════════════════════
+  { id: "z-ai/glm-5.2-free", name: "GLM 5.2 Free [Zenmux]", provider: "zenmux", plan: "zenmux" },
+
   // ══ OPENROUTER BACKEND (fallback) ═════════════════════════════════════════
   { id: "or-claude-opus-4-8",   name: "CLAUDE OPUS 4.8 [OR] 1M (FALLBACK)", provider: "openrouter", plan: "openrouter",
     openrouterId: "anthropic/claude-opus-4-8" },
@@ -110,6 +116,7 @@ const MODEL_ALIASES = {
   // Command Code (free)
   "deepseek":  "deepseek/deepseek-v4-pro",
   "ds":        "deepseek/deepseek-v4-pro",
+  "glm":       "z-ai/glm-5.2-free",
   "kimi":      "moonshotai/kimi-k2.6",
   "qwen":      "qwen-3.7-max",
 };
@@ -179,4 +186,5 @@ module.exports = {
   MODEL_ALIASES,
   ANTHROPIC_BUILTIN_TOOLS,
   OPENROUTER_API_KEY,
+  ZENMUX_API_KEY,
 };

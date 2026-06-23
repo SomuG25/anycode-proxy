@@ -32,7 +32,7 @@ Write-Host ""
 
 # Configure Claude Code for AeroLink direct connection
 claude config set --global apiBaseUrl "https://capi.aerolink.lat"
-claude config set --global apiKey "$AeroKey"
+claude config set --global apiKey "aero_live_y4AJZFqZrA-Hazidd9N2tik7yBBppuUiq4h_ns4Rar4"
 
 Write-Host ""
 Write-Host "✅ Opus mode activated!" -ForegroundColor Green
