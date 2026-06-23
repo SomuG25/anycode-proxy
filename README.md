@@ -180,7 +180,6 @@ docker run -d -p 4141:4141 \
 | `claude-opus-4-8` | Claude Opus 4.8 — best for complex tasks (1M context) |
 | `claude-sonnet-4-6` | Claude Sonnet 4.6 — efficient for routine tasks |
 | `claude-sonnet-4-6-extended` | Sonnet 4.6 with 1M context window |
-| `claude-haiku-4-5` | Claude Haiku 4.5 — fastest for quick answers |
 | `claude-fable-5` | Claude Fable 5 — newest Claude model |
 
 ### 🟢 Command Code — Free ($1/mo Go plan)
@@ -199,7 +198,6 @@ docker run -d -p 4141:4141 \
 |:---|:---|
 | `opus` | `claude-opus-4-8` (→ AeroLink) |
 | `sonnet` | `claude-sonnet-4-6` (→ AeroLink) |
-| `haiku` | `claude-haiku-4-5` (→ AeroLink) |
 | `deepseek` | `deepseek/deepseek-v4-pro` (→ Command Code, free) |
 | `ds` | `deepseek/deepseek-v4-pro` (→ Command Code, free) |
 
@@ -212,7 +210,7 @@ docker run -d -p 4141:4141 \
 # Inside Claude Code, type:
 /model opus
 /model deepseek
-/model haiku
+/model ds
 ```
 
 ### Run two terminals side-by-side
@@ -377,7 +375,7 @@ anycode-proxy/
 ├── package.json
 ├── searxng-settings.yml     # SearXNG config (JSON API enabled)
 ├── stream.js                # SSE stream converter (Alpha → Anthropic)
-├── troll.js                 # Haiku troll mode (joke)
+├── system-prompts.js        # Fable 5-style per-backend system prompt injection
 ├── utils.js                 # HTTP helpers, retry logic
 ├── websearch.js             # SearXNG + DuckDuckGo search engine
 └── .env.example             # Example environment variables

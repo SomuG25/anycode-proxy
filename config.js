@@ -31,6 +31,9 @@ const ALPHA_ENDPOINT = "/alpha/generate";
 // ─── OpenRouter Configuration ─────────────────────────────────────────────────
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || null;
 
+// ─── AeroLink Configuration ────────────────────────────────────────────────
+const AEROLINK_API_KEY = process.env.AEROLINK_API_KEY || null;
+
 // ─── Zenmux Configuration ──────────────────────────────────────────────────
 const ZENMUX_API_KEY = process.env.ZENMUX_API_KEY || null;
 
@@ -87,8 +90,17 @@ const ALL_MODELS = [
   { id: "qwen-3.6-plus",        name: "Qwen 3.6 Plus",        provider: "qwen", plan: "go" },
   { id: "step-3.5-flash", name: "Step 3.5 Flash", provider: "stepfun", plan: "go" },
 
+  // ══ AEROLINK BACKEND (Claude models, cheaper) ════════════════════════════════
+  { id: "claude-opus-4-8-aero",  name: "Claude Opus 4.8 [AeroLink]",  provider: "aerolink", plan: "aerolink" },
+  { id: "claude-sonnet-4-6-aero",name: "Claude Sonnet 4.6 [AeroLink]",provider: "aerolink", plan: "aerolink" },
+  { id: "claude-fable-5-aero",   name: "Claude Fable 5 [AeroLink]",   provider: "aerolink", plan: "aerolink" },
+  { id: "claude-opus-4-7-aero",  name: "Claude Opus 4.7 [AeroLink]",  provider: "aerolink", plan: "aerolink" },
+  { id: "claude-opus-4-6-aero",  name: "Claude Opus 4.6 [AeroLink]",  provider: "aerolink", plan: "aerolink" },
+  { id: "claude-haiku-4-5-aero", name: "Claude Haiku 4.5 [AeroLink]", provider: "aerolink", plan: "aerolink" },
+
   // ══ ZENMUX BACKEND (GLM models) ═════════════════════════════════════════════
-  { id: "z-ai/glm-5.2-free", name: "GLM 5.2 Free [Zenmux]", provider: "zenmux", plan: "zenmux" },
+  { id: "z-ai/glm-5.2-free", name: "GLM 5.2 Free [Zenmux]",   provider: "zenmux", plan: "zenmux" },
+  { id: "z-ai/glm-5.2",      name: "GLM 5.2 [Zenmux] PAYG",    provider: "zenmux", plan: "zenmux" },
 
   // ══ OPENROUTER BACKEND (fallback) ═════════════════════════════════════════
   { id: "or-claude-opus-4-8",   name: "CLAUDE OPUS 4.8 [OR] 1M (FALLBACK)", provider: "openrouter", plan: "openrouter",
@@ -102,7 +114,6 @@ const ALL_MODELS = [
   { id: "claude-opus-4-7",   name: "Claude Opus 4.7",   provider: "anthropic", plan: "pro" },
   { id: "claude-opus-4-6",   name: "Claude Opus 4.6",   provider: "anthropic", plan: "pro" },
   { id: "claude-fable-5",    name: "Claude Fable 5",    provider: "anthropic", plan: "pro" },
-  { id: "claude-haiku", name: "Claude Haiku [TROLL MODE]", provider: "troll", plan: "troll" },
   { id: "gpt-5.5",       name: "GPT-5.5",       provider: "openai", plan: "pro" },
   { id: "gpt-5.4",       name: "GPT-5.4",       provider: "openai", plan: "pro" },
   { id: "gpt-5.3-codex", name: "GPT-5.3 Codex", provider: "openai", plan: "pro" },
@@ -117,8 +128,14 @@ const MODEL_ALIASES = {
   "deepseek":  "deepseek/deepseek-v4-pro",
   "ds":        "deepseek/deepseek-v4-pro",
   "glm":       "z-ai/glm-5.2-free",
+  "glm-pro":   "z-ai/glm-5.2",
   "kimi":      "moonshotai/kimi-k2.6",
   "qwen":      "qwen-3.7-max",
+
+  // AeroLink (Claude models)
+  "opus":      "claude-opus-4-8-aero",
+  "sonnet":    "claude-sonnet-4-6-aero",
+  "fable":     "claude-fable-5-aero",
 };
 
 // ─── Anthropic built-in tool schemas ─────────────────────────────────────────
@@ -186,5 +203,6 @@ module.exports = {
   MODEL_ALIASES,
   ANTHROPIC_BUILTIN_TOOLS,
   OPENROUTER_API_KEY,
+  AEROLINK_API_KEY,
   ZENMUX_API_KEY,
 };

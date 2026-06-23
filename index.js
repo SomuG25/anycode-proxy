@@ -3,6 +3,7 @@ const { PORT, AUTH, CLI_VERSION, ALL_MODELS } = require("./config");
 const { handleModels, handleMessages, handleHealth } = require("./handlers");
 const { respondError } = require("./utils");
 const { getSearchEngineStatus } = require("./websearch");
+const { getAeroLinkStatus } = require("./aerolink");
 
 // ─── Main Server ──────────────────────────────────────────────────────────────
 
@@ -74,6 +75,7 @@ server.listen(PORT, () => {
   console.log(`║  ⚡ AnyCode Proxy on http://localhost:${PORT}            ║`);
   console.log("╠══════════════════════════════════════════════════════════╣");
   console.log("║  🟢 DeepSeek/Qwen  ──→ Command Code (free $1/mo plan)   ║");
+  console.log("║  🔵 Opus/Sonnet    ──→ AeroLink (cheaper Claude)        ║");
   console.log("║  🟡 GLM 5.2         ──→ Zenmux (your API key)           ║");
   console.log("║  🔄 Subagents/bg   ──→ Always DeepSeek (free)           ║");
   console.log("╚══════════════════════════════════════════════════════════╝");
@@ -81,8 +83,10 @@ server.listen(PORT, () => {
   console.log(`  User:         ${AUTH.userName}`);
   console.log(`  CLI Version:  ${CLI_VERSION}`);
   console.log(`  Search:       ${getSearchEngineStatus()}`);
+  console.log(`  📋 Fable5 Prompt: Active (per-backend named sections + self-checks)`);
   const { getZenmuxStatus } = require("./zenmux");
   console.log(`  Zenmux:       ${getZenmuxStatus()}`);
+  console.log(`  AeroLink:     ${getAeroLinkStatus()}`);
   console.log("");
 
   const goModels  = ALL_MODELS.filter((m) => m.plan === "go");
@@ -91,7 +95,14 @@ server.listen(PORT, () => {
   console.log("Available models:");
   console.log("─────────────────────────────────────────────────────────");
 
-  console.log("  🟢 COMMAND CODE — GO PLAN (free — execution engine)");
+  const aeroModels = ALL_MODELS.filter((m) => m.plan === "aerolink");
+  if (aeroModels.length > 0) {
+    console.log("  🔵 AEROLINK (your API key — Claude models)");
+    for (const m of aeroModels) {
+      console.log(`    • ${m.id.padEnd(32)} ${m.name}`);
+    }
+    console.log("");
+  }
 
   const zenModels = ALL_MODELS.filter((m) => m.provider === "zenmux");
   if (zenModels.length > 0) {

@@ -4,13 +4,14 @@ const { convertAnthropicToAlpha } = require("./converter");
 const { AlphaToAnthropicStreamConverter } = require("./stream");
 const { readBody, respond, respondError, forwardToAlpha } = require("./utils");
 const { searchWeb, formatSearchResults } = require("./websearch");
-const { handleHaikuTroll } = require("./troll");
 const {
   convertAnthropicToOpenAI,
   forwardToOpenRouter,
   OpenAIToAnthropicStreamConverter,
 } = require("./openrouter");
 const { handleZenmuxRequest } = require("./zenmux");
+const { handleAeroLinkRequest } = require("./aerolink");
+const { buildSystemPrompt } = require("./system-prompts");
 
 // ─── Model name normalization ─────────────────────────────────────────────────
 // Claude Code sometimes sends versioned model names like "claude-haiku-4-5-20251001"
@@ -30,9 +31,9 @@ const OPENROUTER_MODEL_IDS = new Set(
 const ZENMUX_MODEL_IDS = new Set(
   ALL_MODELS.filter((m) => m.provider === "zenmux").map((m) => m.id)
 );
-
-// Sentinel used to route haiku to the infinite troll loop
-const HAIKU_TROLL_SENTINEL = "claude-haiku-troll";
+const AEROLINK_MODEL_IDS = new Set(
+  ALL_MODELS.filter((m) => m.provider === "aerolink").map((m) => m.id)
+);
 
 function normalizeModel(model) {
   if (!model) return FALLBACK_MODEL;
@@ -43,11 +44,7 @@ function normalizeModel(model) {
   // Check model aliases first (e.g. "sonnet" → "claude-sonnet-4-6")
   if (MODEL_ALIASES[model]) return MODEL_ALIASES[model];
   if (MODEL_ALIASES[stripped]) return MODEL_ALIASES[stripped];
-  // Haiku → troll loop (deliberate: we never run Haiku for real)
-  if (model.startsWith("claude-haiku") || stripped.startsWith("claude-haiku")) {
-    console.log(`  😈 haiku detected → troll mode`);
-    return HAIKU_TROLL_SENTINEL;
-  }
+  // Haiku → routes to DeepSeek V4 Pro via Command Code (no troll mode)
   // If the model (with or without date suffix) is in our registry, pass through
   if (KNOWN_MODEL_IDS.has(model)) return model;
   if (KNOWN_MODEL_IDS.has(stripped)) return stripped;
@@ -61,7 +58,7 @@ function normalizeModel(model) {
 
 // ─── Backend Router ────────────────────────────────────────────────────────────
 function routeToBackend(model) {
-  if (model === HAIKU_TROLL_SENTINEL) return "haiku-troll";
+  if (AEROLINK_MODEL_IDS.has(model)) return "aerolink";
   if (ZENMUX_MODEL_IDS.has(model)) return "zenmux";
   if (OPENROUTER_MODEL_IDS.has(model)) return "openrouter";
   if (model.startsWith("anthropic/")) return "openrouter";
@@ -160,6 +157,23 @@ async function handleMessages(req, res) {
   // ── Determine backend ─────────────────────────────────────────────────
   const backend = routeToBackend(model);
 
+  // ── Inject Fable 5-style system prompt ───────────────────────────────
+  // Prepends structured instructions (named sections, self-checks,
+  // negative examples) tuned to each backend before the user's system message.
+  const injectedPrompt = buildSystemPrompt(body, backend);
+  if (injectedPrompt) {
+    if (typeof body.system === "string") {
+      body.system = injectedPrompt + "\n\n" + body.system;
+    } else if (Array.isArray(body.system)) {
+      body.system = [
+        { type: "text", text: injectedPrompt },
+        ...body.system,
+      ];
+    } else {
+      body.system = injectedPrompt;
+    }
+  }
+
   console.log(`  ├ model=${model} stream=${isStream} route=${backend}`);
   console.log(`  ├ messages=${msgCount} tools=${toolCount} [${requestType}]`);
 
@@ -176,11 +190,6 @@ async function handleMessages(req, res) {
   const ac = new AbortController();
   req.on("close", () => ac.abort());
 
-  // ── Route to Haiku Troll (infinite fake-thinking loop) ───────────────
-  if (backend === "haiku-troll") {
-    return handleHaikuTroll(res, ac);
-  }
-
   // ── Route to OpenRouter ───────────────────────────────────────────────
   if (backend === "openrouter") {
     return handleOpenRouterRequest(body, res, model, ac, isStream);
@@ -189,6 +198,11 @@ async function handleMessages(req, res) {
   // ── Route to Zenmux (GLM models) ─────────────────────────────────────
   if (backend === "zenmux") {
     return handleZenmuxRequest(body, res, model, ac, isStream);
+  }
+
+  // ── Route to AeroLink (Claude models) ─────────────────────────────────
+  if (backend === "aerolink") {
+    return handleAeroLinkRequest(body, res, model, ac, isStream);
   }
 
   // ── Route to Command Code ─────────────────────────────────────────────
